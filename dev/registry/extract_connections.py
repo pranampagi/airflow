@@ -157,6 +157,166 @@ def build_custom_fields(
     return result
 
 
+class MockOptional:
+    """Mock for wtforms.validators.Optional."""
+
+    def __init__(
+        self,
+        *args,
+        **kwargs,
+    ):
+        pass
+
+    def __call__(self, form, field):
+        """No-op call to satisfy WTForms validator protocol."""
+        return None
+
+
+class MockEnum:
+    """Mock for wtforms.validators.AnyOf."""
+
+    def __init__(self, allowed_values):
+        self.allowed_values = allowed_values
+
+
+class MockBaseField:
+    """Mock of WTForms Field."""
+
+    param_type: str = "UNDEFINED"
+    param_format: str | None = None
+    widget = None
+
+    def __init__(
+        self,
+        label: str | None = None,
+        validators=None,
+        description: str = "",
+        default: str | None = None,
+        widget=None,
+        source: str | None = None,
+    ):
+        type: str | list[str] = [self.param_type, "null"]
+        enum = {}
+        format = {"format": self.param_format} if self.param_format else {}
+        if validators:
+            if any(isinstance(v, MockOptional) for v in validators):
+                type = [self.param_type, "null"]
+            for v in validators:
+                if isinstance(v, MockEnum):
+                    enum = {"enum": v.allowed_values}
+        from airflow.serialization.definitions.param import SerializedParam
+
+        self.param = SerializedParam(
+            default=default,
+            title=label,
+            description=description or None,
+            source=source or None,
+            type=type,
+            **format,
+            **enum,
+        )
+        self.widget = widget
+        self.field_class = self.__class__
+
+
+class MockStringField(MockBaseField):
+    """Mock of WTForms StringField."""
+
+    param_type: str = "string"
+
+
+class MockIntegerField(MockBaseField):
+    """Mock of WTForms IntegerField."""
+
+    param_type: str = "integer"
+
+
+class MockPasswordField(MockBaseField):
+    """Mock of WTForms PasswordField."""
+
+    param_type: str = "string"
+    param_format: str | None = "password"
+
+
+class MockBooleanField(MockBaseField):
+    """Mock of WTForms BooleanField."""
+
+    param_type: str = "boolean"
+
+
+class MockAnyWidget:
+    """Mock any flask appbuilder widget."""
+
+
+def _get_hooks_with_mocked_fab() -> tuple[dict, dict, dict]:
+    """Get hooks with all details w/o FAB needing to be installed."""
+    from unittest import mock
+
+    from airflow.providers_manager import ProvidersManager
+
+    def mock_lazy_gettext(txt: str) -> str:
+        """Mock for flask_babel.lazy_gettext."""
+        return txt
+
+    def mock_any_of(allowed_values: list) -> MockEnum:
+        """Mock for wtforms.validators.any_of."""
+        return MockEnum(allowed_values)
+
+    # Before importing ProvidersManager, we need to mock all FAB and WTForms
+    # dependencies to avoid ImportErrors when FAB is not installed.
+    import sys
+    from importlib.util import find_spec
+    from unittest.mock import MagicMock
+
+    for mod_name in [
+        "wtforms",
+        "wtforms.csrf",
+        "wtforms.fields",
+        "wtforms.fields.simple",
+        "wtforms.validators",
+        "flask_babel",
+        "flask_appbuilder",
+        "flask_appbuilder.fieldwidgets",
+    ]:
+        try:
+            if not find_spec(mod_name):
+                raise ModuleNotFoundError
+        except ModuleNotFoundError:
+            sys.modules[mod_name] = MagicMock()
+
+    # We conditionally inject mock classes for missing dependencies
+    # to ensure `ProvidersManager` can initialize hook connection widgets
+    # without crashing when FAB/WTForms are not installed.
+    if "wtforms.StringField" not in sys.modules:
+        # Only apply mocks if the actual module wasn't loaded beforehand.
+        # This avoids thread-safety issues caused by `unittest.mock.patch` mutating global states.
+        with (
+            mock.patch("wtforms.StringField", MockStringField),
+            mock.patch("wtforms.fields.StringField", MockStringField),
+            mock.patch("wtforms.fields.simple.StringField", MockStringField),
+            mock.patch("wtforms.IntegerField", MockIntegerField),
+            mock.patch("wtforms.fields.IntegerField", MockIntegerField),
+            mock.patch("wtforms.PasswordField", MockPasswordField),
+            mock.patch("wtforms.BooleanField", MockBooleanField),
+            mock.patch("wtforms.fields.BooleanField", MockBooleanField),
+            mock.patch("wtforms.fields.simple.BooleanField", MockBooleanField),
+            mock.patch("flask_babel.lazy_gettext", mock_lazy_gettext),
+            mock.patch("flask_appbuilder.fieldwidgets.BS3TextFieldWidget", MockAnyWidget),
+            mock.patch("flask_appbuilder.fieldwidgets.BS3TextAreaFieldWidget", MockAnyWidget),
+            mock.patch("flask_appbuilder.fieldwidgets.BS3PasswordFieldWidget", MockAnyWidget),
+            mock.patch("wtforms.validators.Optional", MockOptional),
+            mock.patch("wtforms.validators.any_of", mock_any_of),
+            # Prevent poisoning the global ProvidersManager singleton with mocks
+            mock.patch("airflow.providers_manager.ProvidersManager._instance", None),
+            mock.patch("airflow.providers_manager.ProvidersManager.initialized", return_value=False),
+        ):
+            pm = ProvidersManager()
+            return pm.hooks, pm.connection_form_widgets, pm.field_behaviours  # type: ignore[return-value] # Will init providers hooks
+    else:
+        pm = ProvidersManager()
+        return pm.hooks, pm.connection_form_widgets, pm.field_behaviours  # type: ignore[return-value] # Will init providers hooks
+
+
 def main():
     parser = argparse.ArgumentParser(description="Extract provider connection metadata")
     parser.add_argument(
@@ -197,12 +357,9 @@ def main():
         provider_versions[p["id"]] = p["version"]
         provider_names[p["id"]] = p.get("name", p["id"])
 
-    # Get connection data from ProvidersManager via HookMetaService
-    # (reuses existing WTForms mocking instead of duplicating it)
+    # Get connection data from ProvidersManager (with FAB mocked out if missing)
     print("Loading ProvidersManager...")
-    from airflow.api_fastapi.core_api.services.ui.connections import HookMetaService
-
-    hooks, form_widgets, field_behaviours = HookMetaService._get_hooks_with_mocked_fab()
+    hooks, form_widgets, field_behaviours = _get_hooks_with_mocked_fab()
 
     generated_at = datetime.now(timezone.utc).isoformat()
 
